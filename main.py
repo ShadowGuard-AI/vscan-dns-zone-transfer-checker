@@ -28,7 +28,9 @@ def check_zone_transfer(domain, nameserver=None):
         nameserver (str, optional): The nameserver to query. If None, attempt to auto-discover nameservers.
 
     Returns:
-        bool: True if a zone transfer is successful, False otherwise.
+        bool: True if a zone transfer is successful, False if the check
+        completed and the transfer was refused or empty, or None if
+        nameserver discovery failed and the check could not run.
     """
 
     try:
@@ -39,17 +41,17 @@ def check_zone_transfer(domain, nameserver=None):
                 nameservers = [str(rdata.target) for rdata in nameserver_answers]
                 if not nameservers:
                     logging.error("Could not automatically determine nameservers for %s.", domain)
-                    return False
+                    return None
                 logging.info("Automatically discovered nameservers: %s", nameservers)
             except dns.resolver.NXDOMAIN:
                 logging.error("Domain %s does not exist.", domain)
-                return False
+                return None
             except dns.resolver.Timeout:
                 logging.error("DNS query timeout while resolving nameservers for %s.", domain)
-                return False
+                return None
             except Exception as e:
                 logging.error("Error resolving nameservers for %s: %s", domain, e)
-                return False
+                return None
 
             for ns in nameservers:
                 try:
@@ -87,7 +89,7 @@ def check_zone_transfer(domain, nameserver=None):
 
     except Exception as e:
         logging.error("An error occurred: %s", e)
-        return False
+        return None
 
 
 def main():
@@ -107,7 +109,11 @@ def main():
 
     logging.info("Starting DNS zone transfer check for %s...", domain)
 
-    if check_zone_transfer(domain, nameserver):
+    result = check_zone_transfer(domain, nameserver)
+    if result is None:
+        print(f"Nameserver discovery failed for {domain}: the zone transfer check could not run, so no verdict could be made.")
+        sys.exit(1)
+    if result:
         logging.info("Zone transfer vulnerability found for %s.", domain)
     else:
         logging.info("Zone transfer vulnerability not found for %s.", domain)
