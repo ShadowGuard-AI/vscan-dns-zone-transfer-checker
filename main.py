@@ -36,6 +36,11 @@ def check_zone_transfer(domain, nameserver=None):
     try:
         if nameserver is None:
             # Attempt to discover nameservers using DNS queries
+            # Discovery goes through the system resolver and its
+            # recursive servers, not the domain's own authoritative
+            # servers, so a split horizon setup can hand back a set of
+            # nameservers an outside checker would never see, or miss
+            # the ones it would.
             try:
                 nameserver_answers = dns.resolver.resolve(domain, 'NS')
                 nameservers = [str(rdata.target) for rdata in nameserver_answers]
@@ -85,6 +90,11 @@ def check_zone_transfer(domain, nameserver=None):
             except Exception as e:
                 logging.error("An unexpected error occurred during zone transfer from %s for %s: %s", nameserver, domain, e)
 
+        # Every failure above lands here as one False, including a
+        # timeout from every nameserver. A network that silently drops
+        # the transfer and a server that refuses it produce the same
+        # "not found" verdict in main, though only one of them is
+        # actually evidence the zone is protected.
         return False  # Zone transfer failed from all nameservers.
 
     except Exception as e:
