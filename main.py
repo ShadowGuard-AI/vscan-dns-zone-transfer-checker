@@ -1,5 +1,7 @@
 import argparse
+import dns.exception
 import dns.query
+import dns.resolver
 import dns.zone
 import logging
 import sys
@@ -19,6 +21,36 @@ def setup_argparse():
     parser.add_argument("nameserver", nargs='?', default=None, help="The nameserver to query. If not provided, the script will attempt to find the domain's nameservers automatically.")
     return parser
 
+def attempt_zone_transfer(nameserver, domain):
+    """
+    Attempts one zone transfer.
+
+    Returns:
+        True if the transfer succeeded (zone data is printed), the
+        string "refused" if the server definitively refused the
+        transfer or returned a malformed or empty answer, or None if
+        the attempt was inconclusive (timeout or unexpected error), so
+        it is no evidence either way about the zone.
+    """
+    try:
+        zone = dns.zone.from_xfr(dns.query.xfr(nameserver, domain, timeout=10))
+        print(f"Zone transfer successful from {nameserver} for domain {domain}:")
+        for name, rdataset in zone.nodes.items():
+            print(f"{name} {rdataset}")
+        return True
+    except dns.exception.FormError:
+        logging.warning("Zone transfer failed from %s for %s (FormError).", nameserver, domain)
+        return "refused"
+    except dns.query.TransferError as e:
+        logging.warning("Zone transfer failed from %s for %s: %s", nameserver, domain, e)
+        return "refused"
+    except (TimeoutError, dns.exception.Timeout):
+        logging.warning("Timeout during zone transfer from %s for %s.", nameserver, domain)
+        return None
+    except Exception as e:
+        logging.error("An unexpected error occurred during zone transfer from %s for %s: %s", nameserver, domain, e)
+        return None
+
 def check_zone_transfer(domain, nameserver=None):
     """
     Attempts to perform a DNS zone transfer from the specified nameserver.
@@ -28,19 +60,20 @@ def check_zone_transfer(domain, nameserver=None):
         nameserver (str, optional): The nameserver to query. If None, attempt to auto-discover nameservers.
 
     Returns:
-        bool: True if a zone transfer is successful, False if the check
-        completed and the transfer was refused or empty, or None if
-        nameserver discovery failed and the check could not run.
+        bool: True if a zone transfer is successful, False if at least
+        one nameserver definitively refused the transfer and none
+        succeeded, or None if the check could not reach a verdict:
+        nameserver discovery failed, or every transfer attempt timed
+        out or errored. A timeout is not evidence that a zone is
+        protected, so it never produces the False verdict.
     """
 
     try:
         if nameserver is None:
-            # Attempt to discover nameservers using DNS queries
-            # Discovery goes through the system resolver and its
-            # recursive servers, not the domain's own authoritative
-            # servers, so a split horizon setup can hand back a set of
-            # nameservers an outside checker would never see, or miss
-            # the ones it would.
+            # Attempt to discover nameservers using DNS queries.
+            # Discovery goes through the configured resolver, so in a
+            # split horizon setup the discovered set is the set that
+            # resolver can see.
             try:
                 nameserver_answers = dns.resolver.resolve(domain, 'NS')
                 nameservers = [str(rdata.target) for rdata in nameserver_answers]
@@ -58,44 +91,24 @@ def check_zone_transfer(domain, nameserver=None):
                 logging.error("Error resolving nameservers for %s: %s", domain, e)
                 return None
 
+            saw_refusal = False
             for ns in nameservers:
-                try:
-                    zone = dns.zone.from_xfr(dns.query.xfr(ns, domain, timeout=10))
-                    print(f"Zone transfer successful from {ns} for domain {domain}:")
-                    for name, rdataset in zone.nodes.items():
-                        print(f"{name} {rdataset}")
+                outcome = attempt_zone_transfer(ns, domain)
+                if outcome is True:
                     return True  # Zone transfer succeeded, no need to try other nameservers
-                except dns.exception.FormError:
-                    logging.warning("Zone transfer failed from %s for %s (FormError).", ns, domain)
-                except dns.query.TransferError as e:
-                    logging.warning("Zone transfer failed from %s for %s: %s", ns, domain, e)
-                except TimeoutError:
-                    logging.warning("Timeout during zone transfer from %s for %s.", ns, domain)
-                except Exception as e:
-                    logging.error("An unexpected error occurred during zone transfer from %s for %s: %s", ns, domain, e)
+                if outcome == "refused":
+                    saw_refusal = True
+            # False only when at least one server actually refused.
+            # If every attempt timed out or errored, there is no verdict.
+            return False if saw_refusal else None
         else:
             # Perform zone transfer using specified nameserver
-            try:
-                zone = dns.zone.from_xfr(dns.query.xfr(nameserver, domain, timeout=10))
-                print(f"Zone transfer successful from {nameserver} for domain {domain}:")
-                for name, rdataset in zone.nodes.items():
-                    print(f"{name} {rdataset}")
+            outcome = attempt_zone_transfer(nameserver, domain)
+            if outcome is True:
                 return True
-            except dns.exception.FormError:
-                logging.warning("Zone transfer failed from %s for %s (FormError).", nameserver, domain)
-            except dns.query.TransferError as e:
-                logging.warning("Zone transfer failed from %s for %s: %s", nameserver, domain, e)
-            except TimeoutError:
-                logging.warning("Timeout during zone transfer from %s for %s.", nameserver, domain)
-            except Exception as e:
-                logging.error("An unexpected error occurred during zone transfer from %s for %s: %s", nameserver, domain, e)
-
-        # Every failure above lands here as one False, including a
-        # timeout from every nameserver. A network that silently drops
-        # the transfer and a server that refuses it produce the same
-        # "not found" verdict in main, though only one of them is
-        # actually evidence the zone is protected.
-        return False  # Zone transfer failed from all nameservers.
+            if outcome == "refused":
+                return False
+            return None
 
     except Exception as e:
         logging.error("An error occurred: %s", e)
@@ -121,7 +134,7 @@ def main():
 
     result = check_zone_transfer(domain, nameserver)
     if result is None:
-        print(f"Nameserver discovery failed for {domain}: the zone transfer check could not run, so no verdict could be made.")
+        print(f"Zone transfer check could not reach a verdict for {domain}: nameserver discovery failed or every transfer attempt timed out or errored, so no verdict could be made.")
         sys.exit(1)
     if result:
         logging.info("Zone transfer vulnerability found for %s.", domain)
@@ -134,12 +147,7 @@ if __name__ == "__main__":
 
 # Usage Examples:
 # 1. Check for zone transfer vulnerability for example.com, automatically determining the nameserver:
-#    python vscan-dns-zone-transfer-checker.py example.com
+#    python3 main.py example.com
 #
 # 2. Check for zone transfer vulnerability for example.com, using a specific nameserver:
-#    python vscan-dns-zone-transfer-checker.py example.com ns1.example.com
-#
-# Offensive Tools Integration:
-#   This script can be integrated into a larger security audit framework or penetration testing tool.
-#   It can be chained with other vulnerability scanners to provide a comprehensive assessment.
-#   The logging output can be parsed to automatically identify vulnerable domains.
+#    python3 main.py example.com ns1.example.com
